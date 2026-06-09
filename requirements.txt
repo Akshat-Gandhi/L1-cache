@@ -1,0 +1,5 @@
+anthropic>=0.40.0
+
+# RAG benchmark dependencies (optional — only needed for benchmark comparison)
+chromadb>=0.5.0
+sentence-transformers>=3.0.0

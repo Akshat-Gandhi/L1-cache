@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "terminal-wiki"
+version = "0.1.0"
+description = "LLM-maintained local wiki as an L1 cache between your terminal and Ollama/Claude"
+requires-python = ">=3.10"
+dependencies = ["anthropic>=0.40.0"]
+
+[project.optional-dependencies]
+benchmark = ["chromadb>=0.5.0", "sentence-transformers>=3.0.0"]
+
+[project.scripts]
+twiki = "cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
