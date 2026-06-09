@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = ["anthropic>=0.40.0"]
 
 [project.optional-dependencies]
-benchmark = ["chromadb>=0.5.0", "sentence-transformers>=3.0.0"]
+benchmark = ["faiss-cpu>=1.8.0", "sentence-transformers>=3.0.0", "numpy>=1.26.0"]
 
 [project.scripts]
 twiki = "cli:main"

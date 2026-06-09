@@ -1,18 +1,19 @@
 """
-RAG benchmark runner.
-Chunks all wiki pages, embeds them with sentence-transformers, stores in ChromaDB.
-For each test case: embed query, retrieve top-K chunks, send to Claude, record metrics.
+RAG benchmark runner — FAISS backend.
 
-This is the apples-to-apples comparison: same corpus, same Claude model, different retrieval.
+Chunks all wiki pages, embeds with sentence-transformers, stores in a FAISS
+flat inner-product index (cosine similarity on normalized vectors).
+
+For each test case: embed query → retrieve top-K chunks → send to Claude.
+Same corpus, same Claude model as L1 runner — only the retrieval differs.
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-import re
 import traceback
+import numpy as np
 import anthropic
-from pathlib import Path
 
 from src.benchmark.test_suite import TestCase, score_response
 from src.benchmark.metrics import RunMetrics, Timer
@@ -21,7 +22,6 @@ from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, BENCHMARK_TOP_K, BENCHMARK_C
 
 
 def _chunk_text(text: str, size: int = BENCHMARK_CHUNK_SIZE) -> list[str]:
-    """Naive word-boundary chunking."""
     words = text.split()
     chunks, current = [], []
     for word in words:
@@ -34,76 +34,81 @@ def _chunk_text(text: str, size: int = BENCHMARK_CHUNK_SIZE) -> list[str]:
     return chunks
 
 
-class RAGIndex:
-    """Lazy-initialized ChromaDB collection over all wiki pages."""
+class FAISSIndex:
+    """Lazy-built FAISS flat inner-product index over wiki chunks."""
 
     def __init__(self):
-        self._collection = None
-        self._client_chroma = None
-        self._embed_model = None
+        self._index = None
+        self._chunks: list[str] = []
+        self._metadata: list[dict] = []
+        self._model = None
 
     def _ensure_built(self) -> None:
-        if self._collection is not None:
+        if self._index is not None:
             return
 
         try:
-            import chromadb
+            import faiss
             from sentence_transformers import SentenceTransformer
         except ImportError:
             raise RuntimeError(
                 "RAG runner requires extra dependencies:\n"
-                "  pip install chromadb sentence-transformers"
+                "  pip install faiss-cpu sentence-transformers"
             )
 
-        self._embed_model = SentenceTransformer(RAG_EMBED_MODEL)
-        self._client_chroma = chromadb.Client()
-        self._collection = self._client_chroma.create_collection("wiki")
+        self._model = SentenceTransformer(RAG_EMBED_MODEL)
 
         pages = list_all_pages()
-        all_chunks, all_ids, all_metas = [], [], []
         for page in pages:
             content = read_wiki_page(page) or ""
             for i, chunk in enumerate(_chunk_text(content)):
-                all_chunks.append(chunk)
-                all_ids.append(f"{page}::{i}")
-                all_metas.append({"page": page, "chunk_index": i})
+                self._chunks.append(chunk)
+                self._metadata.append({"page": page, "chunk_index": i})
 
-        if not all_chunks:
+        if not self._chunks:
             return
 
-        embeddings = self._embed_model.encode(all_chunks, show_progress_bar=False).tolist()
-        self._collection.add(documents=all_chunks, embeddings=embeddings,
-                             ids=all_ids, metadatas=all_metas)
+        embeddings = self._model.encode(self._chunks, show_progress_bar=False, normalize_embeddings=True)
+        dim = embeddings.shape[1]
+
+        self._index = faiss.IndexFlatIP(dim)           # cosine sim via normalized vectors
+        self._index.add(embeddings.astype(np.float32))
 
     def retrieve(self, query: str, k: int = BENCHMARK_TOP_K) -> list[dict]:
-        """Returns list of {chunk, page, chunk_index} dicts."""
         self._ensure_built()
-        if self._collection is None or self._collection.count() == 0:
+        if self._index is None or self._index.ntotal == 0:
             return []
 
-        embedding = self._embed_model.encode([query], show_progress_bar=False).tolist()
-        results = self._collection.query(query_embeddings=embedding, n_results=min(k, self._collection.count()))
-        out = []
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            out.append({"chunk": doc, "page": meta["page"], "chunk_index": meta["chunk_index"]})
-        return out
+        q_emb = self._model.encode([query], normalize_embeddings=True)
+        k_actual = min(k, self._index.ntotal)
+        scores, indices = self._index.search(q_emb.astype(np.float32), k_actual)
+        return [
+            {"chunk": self._chunks[idx], "score": float(scores[0][j]), **self._metadata[idx]}
+            for j, idx in enumerate(indices[0]) if idx >= 0
+        ]
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self._chunks)
 
 
-_INDEX = RAGIndex()
+_INDEX = FAISSIndex()
 
 
 def run_single(case: TestCase) -> RunMetrics:
     m = RunMetrics(system="rag", test_case_id=case.id, category=case.category)
 
     try:
-        # Retrieval
+        query_text = f"{case.command} {case.stderr}"
+
         with Timer() as retrieval_t:
-            chunks = _INDEX.retrieve(f"{case.command} {case.stderr}")
+            chunks = _INDEX.retrieve(query_text)
         m.retrieval_latency_ms = retrieval_t.elapsed_ms
         m.items_retrieved = len(chunks)
 
         context_block = "\n\n---\n\n".join(
-            f"[Source: {c['page']}]\n{c['chunk']}" for c in chunks
+            f"[Source: {c['page']}  score={c['score']:.3f}]\n{c['chunk']}"
+            for c in chunks
         )
 
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -140,15 +145,14 @@ def run_single(case: TestCase) -> RunMetrics:
 
 
 def run_all(cases: list[TestCase]) -> list[RunMetrics]:
-    print("  Building RAG index...")
+    print("  Building FAISS index...")
     try:
         _INDEX._ensure_built()
-        page_count = _INDEX._collection.count() if _INDEX._collection else 0
-        print(f"  Index ready: {page_count} chunks")
+        print(f"  Index ready: {_INDEX.chunk_count} chunks across {len(list_all_pages())} pages")
     except RuntimeError as e:
         print(f"  {e}")
-        return [RunMetrics(system="rag", test_case_id=c.id, category=c.category,
-                           error=str(e)) for c in cases]
+        return [RunMetrics(system="rag", test_case_id=c.id, category=c.category, error=str(e))
+                for c in cases]
 
     results = []
     for i, case in enumerate(cases):
@@ -156,7 +160,7 @@ def run_all(cases: list[TestCase]) -> list[RunMetrics]:
         m = run_single(case)
         status = f"score={m.partial_score:.0%} tokens={m.total_tokens} {m.total_latency_ms:.0f}ms"
         if m.error:
-            status = f"ERROR: {m.error[:60]}"
+            status = f"ERROR: {m.error[:80]}"
         print(f"         {status}")
         results.append(m)
     return results
