@@ -1,3 +1,4 @@
+import re
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -7,106 +8,114 @@ from src.agents.base import BaseAgent, Usage
 from src.utils.wiki import read_agents_md, read_wiki_page
 from src.utils.index import read_index
 
-
-READ_WIKI_TOOL = {
-    "name": "read_wiki_page",
-    "description": (
-        "Read a wiki page by path. Call this after identifying relevant pages from the index. "
-        "Path format: 'errors/permission-denied' or 'commands/systemctl' (no .md, no leading slash)."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Wiki page path, e.g. 'errors/permission-denied'"
-            }
-        },
-        "required": ["path"]
-    }
-}
+_NEW_PAGE_RE = re.compile(r"<!--\s*new-page:\s*([\w/.-]+)\s*-->")
+_PATH_RE     = re.compile(r"(?:errors|commands|concepts)/[\w/-]+")
 
 
 @dataclass
 class QueryResult:
     suggestion: str
     pages_read: list[str] = field(default_factory=list)
-    new_page_hint: str | None = None   # populated if Claude flagged <!-- new-page: ... -->
+    new_page_hint: str | None = None
     usage: Usage = field(default_factory=Usage)
+
+
+IDENTIFY_SYSTEM = """\
+You are a wiki page selector.
+Given a wiki index and a terminal error, output ONLY the 1–3 most relevant page paths.
+One path per line. No explanation, no markdown, no bullet points.
+Example output:
+errors/permission-denied
+commands/systemctl
+"""
+
+SYNTHESIZE_SYSTEM = """\
+You are a Linux terminal assistant. A user ran a command that failed.
+You are given relevant wiki pages. Return the exact fix.
+
+Output format:
+FIX: <exact command(s)>
+WHY: <one sentence>
+SOURCE: [[page/path]]
+
+If the wiki pages don't cover this error, answer from general knowledge and add:
+<!-- new-page: errors/suggested-name -->
+"""
 
 
 class LookupAgent(BaseAgent):
     """
-    Agentic tool-use loop:
-    1. Claude receives error + index.md
-    2. Claude calls read_wiki_page for relevant pages
-    3. Claude synthesizes final answer
+    Two-step approach:
+      Step 1 — identify 1-3 relevant pages from the index (~150 tokens)
+      Step 2 — read those pages, synthesize the fix (~1500 tokens)
+
+    Works with both the anthropic SDK and the claude -p CLI backend.
     """
 
     def query(self, error: str, command: str = "", context: list[str] | None = None) -> QueryResult:
-        system = read_agents_md()
+        system_main = read_agents_md()
         index = read_index()
+        total_usage = Usage()
         context_block = "\n".join(context or [])
 
-        user_content = (
+        # ── Step 1: identify pages ──────────────────────────────────── #
+        identify_prompt = (
+            f"Wiki index:\n{index}\n\n"
             f"Command: {command}\n"
-            f"Error output: {error}\n"
+            f"Error: {error}\n"
             + (f"Recent context:\n{context_block}\n" if context_block else "")
-            + f"\nWiki Index:\n{index}\n\n"
-            "Read the relevant wiki pages and return the fix."
+            + "\nList the 1-3 most relevant page paths."
+        )
+        paths_text, usage1 = self._call_simple(IDENTIFY_SYSTEM, identify_prompt, max_tokens=150)
+        total_usage.merge(usage1)
+
+        pages = _parse_paths(paths_text, index)
+
+        # ── Step 2: read pages + synthesize fix ─────────────────────── #
+        page_contents = {}
+        for p in pages:
+            content = read_wiki_page(p)
+            if content:
+                page_contents[p] = content
+
+        pages_block = "\n\n---\n\n".join(
+            f"[[{path}]]\n{content}" for path, content in page_contents.items()
+        ) or "No wiki pages found for this error."
+
+        fix_prompt = (
+            f"Command: {command}\n"
+            f"Error: {error}\n\n"
+            f"Wiki pages:\n{pages_block}\n\n"
+            "Provide the fix."
+        )
+        fix_text, usage2 = self._call_simple(SYNTHESIZE_SYSTEM, fix_prompt, max_tokens=1024)
+        total_usage.merge(usage2)
+
+        new_page_hint = _extract_new_page_hint(fix_text)
+        return QueryResult(
+            suggestion=fix_text,
+            pages_read=list(page_contents.keys()),
+            new_page_hint=new_page_hint,
+            usage=total_usage,
         )
 
-        messages = [{"role": "user", "content": user_content}]
-        pages_read: list[str] = []
-        total_usage = Usage()
 
-        while True:
-            response, usage = self._call(
-                system=system,
-                messages=messages,
-                max_tokens=1024,
-                tools=[READ_WIKI_TOOL]
-            )
-            total_usage.input_tokens += usage.input_tokens
-            total_usage.output_tokens += usage.output_tokens
-            total_usage.api_calls += usage.api_calls
-
-            if response.stop_reason == "end_turn":
-                suggestion = next(
-                    (b.text for b in response.content if hasattr(b, "text")), ""
-                )
-                new_page_hint = _extract_new_page_hint(suggestion)
-                return QueryResult(
-                    suggestion=suggestion,
-                    pages_read=pages_read,
-                    new_page_hint=new_page_hint,
-                    usage=total_usage,
-                )
-
-            if response.stop_reason == "tool_use":
-                messages.append({"role": "assistant", "content": response.content})
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        path = block.input.get("path", "")
-                        pages_read.append(path)
-                        content = read_wiki_page(path)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": content if content else f"Page not found: {path}"
-                        })
-                messages.append({"role": "user", "content": tool_results})
-
-            else:
-                # Unexpected stop reason — surface whatever text we have
-                suggestion = next(
-                    (b.text for b in response.content if hasattr(b, "text")), ""
-                )
-                return QueryResult(suggestion=suggestion, pages_read=pages_read, usage=total_usage)
+def _parse_paths(text: str, index: str) -> list[str]:
+    """Extract valid wiki paths from Step 1 response."""
+    found = _PATH_RE.findall(text)
+    # Deduplicate, preserve order, limit to 3
+    seen = set()
+    result = []
+    for p in found:
+        p = p.strip("/").rstrip(".")
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+        if len(result) == 3:
+            break
+    return result
 
 
 def _extract_new_page_hint(text: str) -> str | None:
-    import re
-    m = re.search(r"<!--\s*new-page:\s*([\w/.-]+)\s*-->", text)
+    m = _NEW_PAGE_RE.search(text)
     return m.group(1) if m else None

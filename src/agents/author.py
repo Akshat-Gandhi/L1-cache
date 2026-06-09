@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from dataclasses import dataclass
 from src.agents.base import BaseAgent, Usage
-from src.utils.wiki import read_agents_md, render_new_page, write_wiki_page
+from src.utils.wiki import write_wiki_page
 from src.utils.index import add_entry
 from src.utils import log
 
@@ -29,13 +29,12 @@ Output ONLY valid markdown matching this exact schema:
 <[[links]] to other pages if relevant, or empty>
 
 ## Session Notes
-<empty — leave blank>
 
 Rules:
 - Be specific and terse.
 - Use exact commands, not prose descriptions.
 - The title should be the error name or command name in Title Case.
-- For the INDEX_DESCRIPTION line at the very end, output exactly:
+- On the very last line output exactly:
   INDEX: <10-word description for the wiki index>
 """
 
@@ -49,11 +48,9 @@ class AuthorResult:
 
 
 class AuthorAgent(BaseAgent):
-    """Creates a new structured wiki page from an error + optional fix."""
 
     def create_page(self, page_path: str, error: str, command: str = "",
                     fix: str = "", context: str = "") -> AuthorResult:
-        system = AUTHOR_SYSTEM
         user_content = (
             f"Page path: {page_path}\n"
             f"Command: {command}\n"
@@ -63,14 +60,8 @@ class AuthorAgent(BaseAgent):
             + "\nWrite the wiki page now."
         )
 
-        response, usage = self._call(
-            system=system,
-            messages=[{"role": "user", "content": user_content}],
-            max_tokens=1500,
-        )
-
-        raw = next((b.text for b in response.content if hasattr(b, "text")), "")
-        content, index_desc = _split_index_line(raw, page_path)
+        raw, usage = self._call_simple(AUTHOR_SYSTEM, user_content, max_tokens=1500)
+        content, index_desc = _split_index_line(raw)
 
         write_wiki_page(page_path, content)
         add_entry(page_path, index_desc)
@@ -84,9 +75,9 @@ class AuthorAgent(BaseAgent):
         )
 
 
-def _split_index_line(raw: str, page_path: str) -> tuple[str, str]:
+def _split_index_line(raw: str) -> tuple[str, str]:
     lines = raw.splitlines()
-    index_desc = f"See {page_path}"
+    index_desc = "See this page for details"
     clean_lines = []
     for line in lines:
         if line.startswith("INDEX:"):

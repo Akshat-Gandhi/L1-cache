@@ -13,12 +13,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import traceback
 import numpy as np
-import anthropic
 
 from src.benchmark.test_suite import TestCase, score_response
 from src.benchmark.metrics import RunMetrics, Timer
+from src.agents.base import BaseAgent
 from src.utils.wiki import read_agents_md, list_all_pages, read_wiki_page
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, BENCHMARK_TOP_K, BENCHMARK_CHUNK_SIZE, RAG_EMBED_MODEL
+from config import BENCHMARK_TOP_K, BENCHMARK_CHUNK_SIZE, RAG_EMBED_MODEL
+
+# Shared agent for Claude generation (auto-selects SDK vs CLI)
+_GENERATOR = None
+
+def _get_generator() -> BaseAgent:
+    global _GENERATOR
+    if _GENERATOR is None:
+        _GENERATOR = BaseAgent()
+    return _GENERATOR
 
 
 def _chunk_text(text: str, size: int = BENCHMARK_CHUNK_SIZE) -> list[str]:
@@ -111,7 +120,7 @@ def run_single(case: TestCase) -> RunMetrics:
             for c in chunks
         )
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        gen = _get_generator()
         system = read_agents_md()
         user_content = (
             f"Command: {case.command}\n"
@@ -121,18 +130,13 @@ def run_single(case: TestCase) -> RunMetrics:
         )
 
         with Timer() as llm_t:
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=1024,
-                system=system,
-                messages=[{"role": "user", "content": user_content}],
-            )
+            response_text, usage = gen._call_simple(system, user_content, max_tokens=1024)
         m.llm_latency_ms = llm_t.elapsed_ms
         m.total_latency_ms = m.retrieval_latency_ms + m.llm_latency_ms
         m.api_calls = 1
-        m.input_tokens = response.usage.input_tokens
-        m.output_tokens = response.usage.output_tokens
-        m.response_text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        m.input_tokens = usage.input_tokens
+        m.output_tokens = usage.output_tokens
+        m.response_text = response_text
 
         scores = score_response(m.response_text, case)
         m.partial_score = scores["partial"]
